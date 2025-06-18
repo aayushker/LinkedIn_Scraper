@@ -1,5 +1,6 @@
 import time
 import json
+import logging
 from typing import List, Dict, Optional
 from datetime import datetime
 from selenium import webdriver
@@ -9,6 +10,30 @@ from selenium.webdriver.chrome.options import Options
 from selenium.common.exceptions import NoSuchElementException, TimeoutException
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from fastapi import FastAPI, BackgroundTasks
+from pydantic import BaseModel
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('linkedin_scraper.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="LinkedIn Scraper API")
+
+class ScrapeRequest(BaseModel):
+    email: str
+    password: str
+    company_url: str
+    headless: bool = True
+    num_scrolls: int = 12
+    scroll_pause: float = 2.5
+    max_comments: int = 15
 
 class LinkedInScraper:
     def __init__(
@@ -101,22 +126,77 @@ class LinkedInScraper:
             "posts": []
         }
             
+        # Ensure we're on the posts page
+        company_url = company_url.rstrip('/')  # Remove trailing slash if present
+        if not company_url.endswith('/posts'):
+            company_url = f"{company_url}/posts"
+            
+        logger.info(f"Navigating to company posts page: {company_url}")
         self.browser.get(company_url)
         time.sleep(4)
 
-        for _ in range(self.num_scrolls):
+        # Scroll to load more posts
+        logger.info(f"Scrolling page {self.num_scrolls} times to load posts...")
+        last_height = self.browser.execute_script("return document.body.scrollHeight")
+        for i in range(self.num_scrolls):
+            # Scroll down
             self.browser.execute_script("window.scrollTo(0, document.body.scrollHeight);")
             time.sleep(self.scroll_pause)
+            
+            # Calculate new scroll height and compare with last scroll height
+            new_height = self.browser.execute_script("return document.body.scrollHeight")
+            if new_height == last_height:
+                # If heights are the same, we've reached the bottom
+                break
+            last_height = new_height
 
-        post_elements = self.browser.find_elements(By.CSS_SELECTOR, 'div.feed-shared-update-v2')
-        if not post_elements:
-            post_elements = self.browser.find_elements(By.CSS_SELECTOR, 'div.feed-shared-update')
+        # Wait for posts to load
+        time.sleep(2)
 
-        print(f"\nFound {len(post_elements)} posts for {company_name}.\n")
+        # Find posts with multiple selectors
+        logger.info("Finding post elements...")
+        post_elements = []
         
+        # Try different selectors
+        selectors = [
+            'div.feed-shared-update-v2',
+            'div.feed-shared-update',
+            'div.feed-shared-article',
+            'div.feed-shared-external-video',
+            'div.feed-shared-text'
+        ]
+        
+        for selector in selectors:
+            elements = self.browser.find_elements(By.CSS_SELECTOR, selector)
+            if elements:
+                post_elements.extend(elements)
+                logger.debug(f"Found {len(elements)} posts with selector: {selector}")
+
+        # Remove duplicates while preserving order
+        seen = set()
+        post_elements = [x for x in post_elements if not (x in seen or seen.add(x))]
+
+        logger.info(f"Found {len(post_elements)} posts for {company_name}")
+        
+        # Process each post
         for idx, post in enumerate(post_elements, 1):
-            post_data = self._extract_post_data(post, idx)
-            result["posts"].append(post_data)
+            try:
+                # Scroll the post into view first
+                self.browser.execute_script("arguments[0].scrollIntoView({block: 'center', behavior: 'smooth'});", post)
+                time.sleep(2)  # Wait for scroll to complete
+                
+                # Get post data
+                post_data = self._extract_post_data(post, idx)
+                result["posts"].append(post_data)
+                logger.info(f"Successfully processed post {idx}/{len(post_elements)}")
+                
+                # Scroll a bit more to ensure next post is in view
+                self.browser.execute_script("window.scrollBy(0, 100);")
+                time.sleep(1)
+                
+            except Exception as e:
+                logger.error(f"Error processing post {idx}: {str(e)}")
+                continue
 
         # Auto-save if enabled
         if auto_save:
@@ -131,8 +211,6 @@ class LinkedInScraper:
         
         # Extract post text
         try:
-            self.browser.execute_script("arguments[0].scrollIntoView({block: 'center'});", post)
-            time.sleep(1)
             try:
                 more_button = WebDriverWait(post, 5).until(
                     EC.presence_of_element_located((By.CSS_SELECTOR, 'button.feed-shared-inline-show-more-text__see-more-less-toggle'))
@@ -167,7 +245,7 @@ class LinkedInScraper:
                 elif "share" in text or "repost" in text:
                     post_data['shares'] = ''.join(filter(str.isdigit, text)) or "0"
         except Exception as e:
-            print(f"Error extracting dynamic social counts: {e}")
+            logger.error(f"Error extracting dynamic social counts: {e}")
 
         # Extract media
         post_data['image_urls'] = self._extract_media_urls(post, 'img', ['feed-shared-image__image', 'feed-shared-image__img'])
@@ -241,17 +319,19 @@ class LinkedInScraper:
         print(f"Top Comments: {len(post_data['top_comments'])}")
         print('-'*40)
 
-    def save_posts(self, data: Dict, filename: str):
-        """
-        Save scraped posts to a JSON file.
+    # comment out for now 
+    # code to save posts to a file
+    # def save_posts(self, data: Dict, filename: str):
+    #     """
+    #     Save scraped posts to a JSON file.
         
-        Args:
-            data (Dict): Data to save
-            filename (str): Name of the file to save to
-        """
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        print(f"Data saved to {filename}.")
+    #     Args:
+    #         data (Dict): Data to save
+    #         filename (str): Name of the file to save to
+    #     """
+    #     with open(filename, "w", encoding="utf-8") as f:
+    #         json.dump(data, f, ensure_ascii=False, indent=2)
+    #     print(f"Data saved to {filename}.")
 
     def close(self):
         """Close the browser."""
@@ -259,46 +339,47 @@ class LinkedInScraper:
             self.browser.quit()
             self.browser = None
 
-# Example usage
-if __name__ == "__main__":
-    # Example configuration
-    config = {
-        "email": "your_email@example.com",
-        "password": "your_password",
-        "headless": False,
-        "window_size": (1200, 900),
-        "num_scrolls": 12,
-        "scroll_pause": 2.5,
-        "max_comments": 15
-    }
+# API Endpoints
+@app.post("/scrape")
+async def scrape_linkedin(request: ScrapeRequest):
+    logger.info(f"Received scrape request for: {request.company_url}")
     
-    company_url = "https://www.linkedin.com/company/company-name/posts/"
-    
-    scraper = LinkedInScraper(**config)
+    scraper = LinkedInScraper(
+        email=request.email,
+        password=request.password,
+        headless=request.headless,
+        num_scrolls=request.num_scrolls,
+        scroll_pause=request.scroll_pause,
+        max_comments=request.max_comments
+    )
     
     try:
-        # Login to LinkedIn
-        if scraper.login():
-            # Scrape posts from a company
-            result = scraper.scrape_company_posts(company_url, auto_save=True)
-            
-            # The result contains:
-            # - company_name: extracted from URL
-            # - timestamp: when the scraping was done
-            # - source_url: the original URL
-            # - posts: list of all scraped posts
-            
-            # You can access the data like this:
-            print(f"Scraped {len(result['posts'])} posts from {result['company_name']}")
-            print(f"Data was saved to: {result['company_name']}_posts_{result['timestamp']}.json")
-            
-            # You can also process the posts data
-            for post in result['posts']:
-                # Process each post as needed
-                pass
-            
+        logger.info("Starting LinkedIn scraping process...")
+        
+        if not scraper.login():
+            logger.error("Login failed")
+            return {"error": "Login failed"}
+        
+        result = scraper.scrape_company_posts(request.company_url)
+        logger.info(f"Scraping completed successfully. Found {len(result['posts'])} posts")
+        return {"success": True, "data": result}
+    
     except Exception as e:
-        print(f"\n[Error] {e}")
+        logger.error(f"Scraping failed with error: {str(e)}")
+        return {"error": str(e)}
+    
     finally:
-        # Always close the browser
         scraper.close()
+
+@app.get("/")
+async def root():
+    logger.info("Health check endpoint accessed")
+    return {"message": "LinkedIn Scraper API is running"}
+
+if __name__ == "__main__":
+    import uvicorn
+    import os
+    
+    port = int(os.getenv("PORT", 8000))
+    logger.info(f"Starting LinkedIn Scraper API on port {port}")
+    uvicorn.run(app, host="0.0.0.0", port=port)
